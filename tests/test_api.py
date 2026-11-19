@@ -13,6 +13,8 @@ client = TestClient(app)
 def clean_tables():
     conn = db.get_conn()
     with db.lock():
+        conn.execute("DELETE FROM receipt_items")
+        conn.execute("DELETE FROM receipts")
         conn.execute("DELETE FROM observations")
         conn.execute("DELETE FROM calibration_points")
     yield
@@ -303,3 +305,155 @@ def test_docs_and_openapi_available():
     paths = client.get("/openapi.json").json()["paths"]
     for p in ("/observations", "/calibrations", "/tide-levels", "/observations/{obs_id}"):
         assert p in paths
+
+
+# ---------------------------------------------------------------- 缓存清单签收
+
+MANIFEST = [
+    {"obs_id": "c1", "counter": 100, "tide_level": 1.25},
+    {"obs_id": "c2", "counter": 200, "tide_level": 2.5},
+    {"obs_id": "c3", "counter": 300, "tide_level": 3.75},
+]
+
+
+def seed_segment(items=None, segment="A"):
+    post_obs([
+        {"obs_id": it["obs_id"], "boot_segment": segment,
+         "counter": it["counter"], "tide_level": it["tide_level"]}
+        for it in (items or MANIFEST)
+    ])
+
+
+def post_receipt(manifest, segment="A", expect=200):
+    r = client.post("/docs", json={"boot_segment": segment, "observations": manifest})
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def test_receipt_signs_after_full_match():
+    seed_segment()
+    body = post_receipt(MANIFEST)
+    assert body["receipt_no"].startswith("RC-")
+    assert body["boot_segment"] == "A"
+    assert [it["obs_id"] for it in body["items"]] == ["c1", "c2", "c3"]
+    assert {it["counter"] for it in body["items"]} == {100, 200, 300}
+    assert {it["tide_level"] for it in body["items"]} == {1.25, 2.5, 3.75}
+
+
+def test_receipt_lists_missing_and_mismatched_ids():
+    seed_segment(MANIFEST[:2])
+    manifest = MANIFEST[:2] + [{"obs_id": "c9", "counter": 900, "tide_level": 9.0}]
+    body = post_receipt(manifest, expect=409)
+    assert body["detail"]["missing"] == ["c9"]
+    assert body["detail"]["missing_obs_ids"] == ["c9"]
+    assert body["detail"]["mismatched"] == []
+
+    seed_segment([MANIFEST[0], {**MANIFEST[1], "tide_level": 99.0}])
+    body = post_receipt(MANIFEST[:2], expect=409)
+    assert body["detail"]["mismatched"] == ["c2"]
+    assert body["detail"]["missing"] == []
+    # 未签收，也没有保护记录：不符观测仍可被补传覆盖
+    post_obs([{"obs_id": "c2", "boot_segment": "A", "counter": 200,
+               "tide_level": 2.5}])
+    assert post_receipt(MANIFEST[:2])["receipt_no"].startswith("RC-")
+
+
+def test_receipt_retry_after_supplement_upload():
+    seed_segment(MANIFEST[:2])
+    # 清单只列已收的两条即全部吻合，可以签收
+    first = post_receipt(MANIFEST[:2])
+    # 补传第三条后，同段换内容清单被拒绝，原签收号不变
+    seed_segment(MANIFEST)
+    body = post_receipt(MANIFEST, expect=409)
+    assert body["detail"]["receipt_no"] == first["receipt_no"]
+
+
+def test_receipt_reorder_returns_same_no_and_changed_content_rejected():
+    seed_segment()
+    first = post_receipt(MANIFEST)
+    reordered = list(reversed(MANIFEST))
+    again = post_receipt(reordered)
+    assert again["receipt_no"] == first["receipt_no"]
+    assert [it["obs_id"] for it in again["items"]] == ["c1", "c2", "c3"]
+
+    changed = [{**it, "tide_level": it["tide_level"] + 0.5} for it in MANIFEST]
+    body = post_receipt(changed, expect=409)
+    assert body["detail"]["receipt_no"] == first["receipt_no"]
+    # 只留一份清单
+    assert client.get(f"/docs/{first['receipt_no']}").json()["items"] == first["items"]
+
+
+def test_receipt_protects_raw_but_allows_calibration_updates():
+    post_cal([
+        {"boot_segment": "A", "counter": 0, "utc_ms": 1000},
+        {"boot_segment": "A", "counter": 1000, "utc_ms": 11000},
+    ])
+    seed_segment()
+    receipt = post_receipt(MANIFEST)
+    assert get_obs("c2").json()["utc_ms"] == 3000
+
+    # 原样重传整批可接受
+    resp = post_obs([
+        {"obs_id": it["obs_id"], "boot_segment": "A",
+         "counter": it["counter"], "tide_level": it["tide_level"]}
+        for it in MANIFEST
+    ])
+    assert changed_ids(resp) == set()
+
+    # 批内任一条与已签收原文不符 -> 整批拒绝
+    bad = [
+        {"obs_id": "c1", "boot_segment": "A", "counter": 100, "tide_level": 1.25},
+        {"obs_id": "c2", "boot_segment": "A", "counter": 200, "tide_level": 2.5001},
+        {"obs_id": "c3", "boot_segment": "A", "counter": 300, "tide_level": 3.75},
+    ]
+    r = client.post("/observations", json={"observations": bad})
+    assert r.status_code == 409
+    assert r.json()["detail"]["obs_id"] == "c2"
+    # 原文未被改写
+    c2 = get_obs("c2").json()
+    assert (c2["counter"], c2["tide_level"]) == (200, 2.5)
+
+    # 补登校时点仍可改变 UTC 与供数状态
+    resp = post_cal([{"boot_segment": "A", "counter": 1000, "utc_ms": 21000}])
+    assert changed_ids(resp) == {"c1", "c2", "c3"}
+    assert get_obs("c2").json()["utc_ms"] == 5000
+    assert tide(0, 99999)["count"] == 3
+
+    # 签收记保持不变
+    assert client.get(f"/docs/{receipt['receipt_no']}").json()["items"] == receipt["items"]
+
+
+def test_receipt_rejects_observation_from_other_segment():
+    seed_segment(MANIFEST[:2])
+    seed_segment(MANIFEST[2:], segment="B")
+    body = post_receipt(MANIFEST, expect=409)
+    assert body["detail"]["mismatched"] == ["c3"]
+    assert client.get("/docs/RC-NOPE").status_code == 404
+
+
+def test_receipt_persists_across_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUOY_DB", str(tmp_path / "buoy.db"))
+    db.reset_for_tests()
+    try:
+        seed_segment()
+        receipt = post_receipt(MANIFEST)
+        db.reset_for_tests()  # 模拟重启：丢弃连接后重新打开同一库
+        for url in (
+            f"/docs/{receipt['receipt_no']}",
+            None,
+        ):
+            if url is None:
+                r = client.get("/docs", params={"receipt_no": receipt["receipt_no"]})
+            else:
+                r = client.get(url)
+            assert r.status_code == 200
+            assert r.json()["items"] == receipt["items"]
+        # 重启后保护仍生效
+        r = client.post("/observations", json={"observations": [
+            {"obs_id": "c1", "boot_segment": "A", "counter": 100,
+             "tide_level": 1.25001},
+        ]})
+        assert r.status_code == 409
+    finally:
+        db.reset_for_tests()
+        monkeypatch.setenv("BUOY_DB", ":memory:")

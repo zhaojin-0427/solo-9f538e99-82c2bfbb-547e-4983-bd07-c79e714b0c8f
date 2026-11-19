@@ -5,15 +5,19 @@ UTC 毫秒时间线供潮位分析：
 
   POST /observations   分批提交观测（ID、开机段、计数、潮位）
   POST /calibrations   分批提交校时点（开机段、计数、UTC 毫秒）
+  POST /docs           提交开机段 + 缓存清单，核对签收
+  GET  /docs/{receipt_no}  按签收号查询已签收清单（也可 /docs?receipt_no=...）
   GET  /tide-levels    按 UTC 毫秒范围查可用潮位
   GET  /observations/{obs_id}  按观测 ID 查状态与原因
-  GET  /docs           Swagger UI
+  GET  /docs           Swagger UI（不带 receipt_no 时）
 """
 
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import JSONResponse
+from pydantic import AliasChoices, BaseModel, Field
 
 from . import core, db
 
@@ -21,6 +25,7 @@ app = FastAPI(
     title="单浮标潮位校时服务",
     description=__doc__,
     version="1.0.0",
+    docs_url=None,  # /docs 同时承担 Swagger UI 与签收清单查询，见下方 docs()
 )
 
 
@@ -79,6 +84,56 @@ class CalibrationBasis(BaseModel):
     hi: CalibrationEndpoint = Field(description="上界校时点")
 
 
+class ManifestItem(BaseModel):
+    obs_id: str = Field(
+        min_length=1,
+        description="观测 ID",
+        validation_alias=AliasChoices("obs_id", "observation_id", "id"),
+    )
+    counter: int = Field(
+        ge=0,
+        description="段内计数",
+        validation_alias=AliasChoices("counter", "count", "segment_count"),
+    )
+    tide_level: float = Field(
+        description="潮位",
+        validation_alias=AliasChoices("tide_level", "tide", "level"),
+    )
+
+
+ManifestItem.model_rebuild()
+
+
+class ManifestItemIn(ManifestItem):
+    boot_segment: str | None = Field(
+        default=None,
+        description="可选：逐项开机段；缺省沿用顶层开机段",
+        validation_alias=AliasChoices("boot_segment", "segment"),
+    )
+
+
+class ReceiptRequest(BaseModel):
+    boot_segment: str | None = Field(
+        default=None,
+        description="开机段；也可在清单每项中给出",
+        validation_alias=AliasChoices("boot_segment", "segment", "boot"),
+    )
+    observations: list[ManifestItemIn] = Field(
+        min_length=1,
+        description="缓存清单；每项含观测 ID、段内计数和潮位",
+        validation_alias=AliasChoices(
+            "observations", "manifest", "items", "entries",
+            "cache_manifest", "cache",
+        ),
+    )
+
+
+class ReceiptResult(BaseModel):
+    receipt_no: str = Field(description="签收号；同段内容相同的换序重提返回原号")
+    boot_segment: str
+    items: list[ManifestItem] = Field(description="已签收清单，可据此清除设备缓存")
+
+
 class ObservationDetail(BaseModel):
     obs_id: str
     boot_segment: str
@@ -102,9 +157,19 @@ def submit_observations(batch: ObservationBatch) -> BatchResult:
     conn = db.get_conn()
     with db.lock():
         with db.transaction(conn):
-            ids = core.upsert_observations(
-                conn, [o.model_dump() for o in batch.observations]
-            )
+            try:
+                ids = core.upsert_observations(
+                    conn, [o.model_dump() for o in batch.observations]
+                )
+            except core.SealedRawError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "批内含与已签收原文不符的观测，整批拒绝",
+                        "obs_id": exc.obs_id,
+                        "reason": exc.detail,
+                    },
+                )
             changed = core.fetch_states(conn, ids)
     return BatchResult(changed_count=len(changed), changed=changed)
 
@@ -133,6 +198,116 @@ def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
                 )
             changed = core.fetch_states(conn, ids)
     return BatchResult(changed_count=len(changed), changed=changed)
+
+
+# ---------------------------------------------------------------- 缓存清单签收
+
+def _receipt_result(receipt: dict) -> ReceiptResult:
+    return ReceiptResult(
+        receipt_no=receipt["receipt_no"],
+        boot_segment=receipt["boot_segment"],
+        items=[
+            ManifestItem(
+                obs_id=it["obs_id"],
+                counter=it["counter"],
+                tide_level=it["tide_level"],
+            )
+            for it in receipt["items"]
+        ],
+    )
+
+
+@app.post(
+    "/docs",
+    response_model=ReceiptResult,
+    summary="提交开机段与缓存清单，核对签收",
+)
+def submit_receipt(req: ReceiptRequest) -> ReceiptResult:
+    """核对一段的缓存清单，全部与岸站已收原文吻合才签收并返回签收号。
+
+    - 每项须含观测 ID、段内计数和潮位；任一项缺收或不符则不签收，
+      响应列出对应观测 ID，补传后可再次提交核对。
+    - 一段只签收一份清单：内容相同（换序）重提返回原签收号，不新增签收；
+      内容不同则拒绝（409）。
+    - 签收后清单内观测受保护：`/observations` 只能原样重传，任一条原文
+      不符整批拒绝（409）；补登校时点仍可改变 UTC 与供数状态。
+    - 失败不新增签收或保护记录。
+    """
+    conn = db.get_conn()
+    items = [it.model_dump() for it in req.observations]
+    segment = req.boot_segment
+    if segment is None:
+        item_segments = {it["boot_segment"] for it in items}
+        if None in item_segments or len(item_segments) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail="清单须属于同一开机段：请给出顶层 boot_segment",
+            )
+        segment = item_segments.pop()
+    with db.lock():
+        with db.transaction(conn):
+            try:
+                receipt = core.sign_receipt(conn, segment, items)
+            except core.ReceiptMismatch as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "清单与岸站已收原文不符，未签收",
+                        "missing_obs_ids": exc.missing,
+                        "mismatched_obs_ids": exc.mismatched,
+                        "missing": exc.missing,
+                        "mismatched": exc.mismatched,
+                        "unmatched_obs_ids": exc.missing + exc.mismatched,
+                        "issues": exc.issues,
+                    },
+                )
+            except core.ReceiptConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "该开机段已签收内容不同的清单，拒绝新清单",
+                        "receipt_no": exc.receipt_no,
+                    },
+                )
+    return _receipt_result(receipt)
+
+
+@app.get(
+    "/docs/{receipt_no}",
+    response_model=ReceiptResult,
+    summary="按签收号查询已签收清单",
+)
+def get_receipt(receipt_no: str) -> ReceiptResult:
+    """重启后仍可按签收号查询已签收清单（签收记录落库）。"""
+    conn = db.get_conn()
+    with db.lock():
+        receipt = core.receipt_detail(conn, receipt_no)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"签收号 '{receipt_no}' 不存在")
+    return _receipt_result(receipt)
+
+
+@app.get("/docs", include_in_schema=False)
+def docs(receipt_no: str | None = Query(default=None, description="签收号")):
+    """不带签收号返回 Swagger UI；带 `receipt_no` 按其查询已签收清单。"""
+    if receipt_no is None:
+        return get_swagger_ui_html(openapi_url="/openapi.json", title="单浮标潮位校时服务")
+    conn = db.get_conn()
+    with db.lock():
+        receipt = core.receipt_detail(conn, receipt_no)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"签收号 '{receipt_no}' 不存在")
+    return JSONResponse(content=_receipt_result(receipt).model_dump())
+
+
+@app.get(
+    "/receipts/{receipt_no}",
+    response_model=ReceiptResult,
+    include_in_schema=False,
+)
+def get_receipt_alias(receipt_no: str) -> ReceiptResult:
+    """`GET /docs/{receipt_no}` 的别名（便于不愿占用 /docs 路径的客户端）。"""
+    return get_receipt(receipt_no)
 
 
 # ---------------------------------------------------------------- 查询

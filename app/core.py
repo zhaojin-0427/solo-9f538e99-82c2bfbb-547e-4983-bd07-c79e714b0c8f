@@ -12,7 +12,10 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import sqlite3
+import uuid
 from typing import Iterable
 
 OK = "ok"
@@ -181,6 +184,8 @@ def upsert_observations(conn: sqlite3.Connection, items: list[dict]) -> list[str
     """
     if not items:
         return []
+    # 已签收观测只允许原样重传；任一条原文不符即整批拒绝
+    assert_sealed_unchanged(conn, items)
     segments = {it["boot_segment"] for it in items}
     points_by_seg = {s: load_points(conn, s) for s in segments}
     ids = [it["obs_id"] for it in items]
@@ -257,6 +262,222 @@ class MonotonicViolation(Exception):
     def __init__(self, violations: list[dict]):
         super().__init__("calibration points make UTC go backwards within a segment")
         self.violations = violations
+
+
+# ---------------------------------------------------------------- 签收保护
+
+class SealedRawError(Exception):
+    """观测已签收，原始字段被改写或整条缺失；整批拒绝。"""
+
+    def __init__(self, obs_id: str, detail: str):
+        super().__init__(detail)
+        self.obs_id = obs_id
+        self.detail = detail
+
+
+def sealed_items(conn: sqlite3.Connection, obs_ids: Iterable[str]) -> dict[str, sqlite3.Row]:
+    """给定观测中已签收的清单原文：obs_id -> row(boot_segment, counter, tide_level)。"""
+    ids = sorted({i for i in obs_ids})
+    if not ids:
+        return {}
+    ph = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT receipt_id, obs_id, boot_segment, counter, tide_level "
+        f"FROM receipt_items WHERE obs_id IN ({ph})",
+        ids,
+    ).fetchall()
+    return {r["obs_id"]: r for r in rows}
+
+
+def _sealed_mismatch(sealed: sqlite3.Row, item: dict) -> str | None:
+    """已签收观测与再次提交的原文比较；不符返回原因。"""
+    if sealed["boot_segment"] != item["boot_segment"]:
+        return "开机段与签收原文不符"
+    if sealed["counter"] != item["counter"]:
+        return "段内计数与签收原文不符"
+    if sealed["tide_level"] != item["tide_level"]:
+        return "潮位与签收原文不符"
+    return None
+
+
+def assert_sealed_unchanged(conn: sqlite3.Connection, items: list[dict]) -> None:
+    """整批校验：任一已签收观测的原文被改写即拒绝整批。"""
+    sealed = sealed_items(conn, (it["obs_id"] for it in items))
+    for it in items:
+        row = sealed.get(it["obs_id"])
+        if row is None:
+            continue
+        detail = _sealed_mismatch(row, it)
+        if detail:
+            raise SealedRawError(it["obs_id"], f"观测 '{it['obs_id']}' {detail}")
+
+
+# ---------------------------------------------------------------- 缓存清单签收
+
+class ReceiptConflict(Exception):
+    """同段已有签收清单且内容不同；拒绝新清单。"""
+
+    def __init__(self, receipt_no: str):
+        super().__init__("segment already has a receipt with different content")
+        self.receipt_no = receipt_no
+
+
+class ReceiptMismatch(Exception):
+    """清单与岸站已收原文不一致，不能签收。"""
+
+    def __init__(self, missing: list[str], mismatched: list[str], issues: list[dict]):
+        super().__init__("manifest does not match received observations")
+        self.missing = missing
+        self.mismatched = mismatched
+        self.issues = issues
+
+
+def receipt_signature(segment: str, items: list[dict]) -> str:
+    """清单内容指纹：段 + 每项观测 ID/计数/潮位；与清单顺序无关。"""
+    canonical = json.dumps(
+        {
+            "boot_segment": segment,
+            "items": sorted(
+                (
+                    {
+                        "obs_id": it["obs_id"],
+                        "boot_segment": it.get("boot_segment") or segment,
+                        "counter": it["counter"],
+                        "tide_level": it["tide_level"],
+                    }
+                    for it in items
+                ),
+                key=lambda it: it["obs_id"],
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _receipt_head(conn: sqlite3.Connection, receipt_no: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, receipt_no, boot_segment FROM receipts WHERE receipt_no = ?",
+        (receipt_no,),
+    ).fetchone()
+
+
+def _receipt_items(conn: sqlite3.Connection, receipt_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT obs_id, counter, tide_level FROM receipt_items "
+        "WHERE receipt_id = ? ORDER BY position",
+        (receipt_id,),
+    ).fetchall()
+    return [
+        {
+            "obs_id": r["obs_id"],
+            "counter": r["counter"],
+            "tide_level": r["tide_level"],
+        }
+        for r in rows
+    ]
+
+
+def receipt_detail(conn: sqlite3.Connection, receipt_no: str) -> dict | None:
+    """按签收号读取已签收清单（落库，重启后仍可查询）。"""
+    head = _receipt_head(conn, receipt_no)
+    if head is None:
+        return None
+    return {
+        "receipt_no": head["receipt_no"],
+        "boot_segment": head["boot_segment"],
+        "items": _receipt_items(conn, head["id"]),
+    }
+
+
+def receipt_by_segment(conn: sqlite3.Connection, segment: str) -> dict | None:
+    row = conn.execute(
+        "SELECT receipt_no FROM receipts WHERE boot_segment = ?", (segment,)
+    ).fetchone()
+    return receipt_detail(conn, row["receipt_no"]) if row else None
+
+
+def sign_receipt(conn: sqlite3.Connection, segment: str, items: list[dict]) -> dict:
+    """核对并签收一份缓存清单（假定已在事务内）。
+
+    规则：
+      - 一段只签收一份清单；换序重提（内容相同）返回原签收号；
+      - 同段已签收但内容不同 -> ReceiptConflict（拒绝，不新增签收）；
+      - 清单任一项与岸站已收原文不符或缺失 -> ReceiptMismatch（拒绝）。
+    失败时调用方回滚事务，不留下签收或保护记录。
+    """
+    items = [
+        {
+            "obs_id": it["obs_id"],
+            "boot_segment": it.get("boot_segment") or segment,
+            "counter": it["counter"],
+            "tide_level": it["tide_level"],
+        }
+        for it in items
+    ]
+    existing = receipt_by_segment(conn, segment)
+    if existing is not None:
+        if receipt_signature(segment, existing["items"]) != receipt_signature(segment, items):
+            raise ReceiptConflict(existing["receipt_no"])
+        return existing
+
+    # 核对岸站已收原文
+    ids = [it["obs_id"] for it in items]
+    ph = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT obs_id, boot_segment, counter, tide_level FROM observations "
+        f"WHERE obs_id IN ({ph})",
+        ids,
+    ).fetchall()
+    by_id = {r["obs_id"]: r for r in rows}
+    sealed_elsewhere = sealed_items(conn, ids)
+
+    missing: list[str] = []
+    mismatched: list[str] = []
+    issues: list[dict] = []
+    seen: set[str] = set()
+    for it in items:
+        if it["obs_id"] in seen:
+            mismatched.append(it["obs_id"])
+            issues.append({"obs_id": it["obs_id"], "reason": "清单内观测 ID 重复"})
+            continue
+        seen.add(it["obs_id"])
+        row = by_id.get(it["obs_id"])
+        if row is None:
+            missing.append(it["obs_id"])
+            issues.append({"obs_id": it["obs_id"], "reason": "岸站未收到该观测"})
+            continue
+        if it["boot_segment"] != segment or row["boot_segment"] != segment:
+            mismatched.append(it["obs_id"])
+            issues.append({"obs_id": it["obs_id"], "reason": "开机段与签收段不符"})
+            continue
+        if (row["counter"], row["tide_level"]) != (it["counter"], it["tide_level"]):
+            mismatched.append(it["obs_id"])
+            issues.append({"obs_id": it["obs_id"], "reason": "与岸站已收原文不符"})
+            continue
+        if it["obs_id"] in sealed_elsewhere:
+            mismatched.append(it["obs_id"])
+            issues.append({"obs_id": it["obs_id"], "reason": "已被其他签收清单保护"})
+    if missing or mismatched:
+        raise ReceiptMismatch(missing, mismatched, issues)
+
+    receipt_no = "RC-" + uuid.uuid4().hex[:16].upper()
+    cur = conn.execute(
+        "INSERT INTO receipts (receipt_no, boot_segment, created_at) "
+        "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        (receipt_no, segment),
+    )
+    for position, it in enumerate(items):
+        conn.execute(
+            "INSERT INTO receipt_items (receipt_id, obs_id, boot_segment, counter, "
+            "tide_level, position) VALUES (?,?,?,?,?,?)",
+            (cur.lastrowid, it["obs_id"], segment, it["counter"],
+             it["tide_level"], position),
+        )
+    return {"receipt_no": receipt_no, "boot_segment": segment,
+            "items": _receipt_items(conn, cur.lastrowid)}
 
 
 def upsert_calibrations(conn: sqlite3.Connection, items: list[dict]) -> list[str]:

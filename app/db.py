@@ -41,6 +41,27 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_utc_ms ON observations(utc_ms);
 CREATE INDEX IF NOT EXISTS idx_observations_segment ON observations(boot_segment);
+
+-- 缓存核对签收：每个开机段最多一份已签收清单
+CREATE TABLE IF NOT EXISTS receipts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_no   TEXT NOT NULL UNIQUE,   -- 签收号
+    boot_segment TEXT NOT NULL UNIQUE,   -- 一段一份清单
+    created_at   TEXT NOT NULL
+);
+
+-- 签收清单原文（保护记录）：签收后这些观测的原文字段不得再被改写
+CREATE TABLE IF NOT EXISTS receipt_items (
+    receipt_id   INTEGER NOT NULL REFERENCES receipts(id),
+    obs_id       TEXT NOT NULL UNIQUE,
+    boot_segment TEXT NOT NULL,
+    counter      INTEGER NOT NULL,
+    tide_level   REAL NOT NULL,
+    position     INTEGER NOT NULL,       -- 清单中的原始顺序
+    PRIMARY KEY (receipt_id, obs_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_receipt_items_receipt ON receipt_items(receipt_id);
 """
 
 

@@ -116,7 +116,46 @@ pytest                 # 运行测试
 ### 其他
 
 - `GET /health` — 健康检查
-- `GET /docs` — Swagger UI；`GET /openapi.json` — OpenAPI 模式
+- `GET /docs` — Swagger UI（带 `?receipt_no=` 时查询签收清单）
+- `GET /openapi.json` — OpenAPI 模式
+
+## 缓存核对签收
+
+回收浮标前，岸站核对设备缓存，确认哪些原始观测可以从设备上清除。
+
+### `POST /docs` — 提交开机段 + 缓存清单，核对签收
+
+```json
+{
+  "boot_segment": "boot-1",
+  "observations": [
+    {"obs_id": "obs-1", "counter": 1500, "tide_level": 2.34},
+    {"obs_id": "obs-2", "counter": 2500, "tide_level": 2.36}
+  ]
+}
+```
+
+- 清单每项含观测 ID、段内计数和潮位；全部与岸站已收原文吻合才签收，
+  返回签收号，清单内缓存即可清除。
+- 任一项**缺收**或**不符**则不签收（`409`），响应直接列出这些观测 ID：
+  `missing`（缺收）、`mismatched`（不符）、`unmatched_obs_ids`（两者合并）。
+  补传后再提交同一清单核对。
+- 一段只签收一份清单：内容相同（**换序**）重提返回原签收号，不新增签收；
+  内容不同则拒绝（`409`，返回已有签收号）。签收号形如 `RC-...`。
+- 失败不新增签收或保护记录。
+
+### `GET /docs/{receipt_no}` — 按签收号查询已签收清单
+
+签收记录写入 SQLite，重启后仍可按号查询。响应含 `receipt_no`、
+`boot_segment` 与已签收的 `items`（观测 ID、段内计数、潮位）。
+也可用 `GET /docs?receipt_no=<签收号>`（`/docs` 不带参数仍是 Swagger UI）。
+
+### 签收后的保护
+
+- `POST /observations` 可**原样重传**已签收观测；批内任一条原文与已签收原文
+  不符即整批拒绝（`409`），不写入任何观测。
+- 补登校时点（`POST /calibrations`）仍可改变已签收观测的 UTC 与供数状态。
+- 核对签收、补传更正均按实际提交顺序生效（同一把进程锁 + 单事务）。
 
 ## 目录结构
 
